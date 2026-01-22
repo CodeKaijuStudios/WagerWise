@@ -1,293 +1,349 @@
-"""
-WagerWise Flask Application Entry Point
-Main entry point for the Flask application with all configurations and initializations
-"""
-
-import os
+from flask import Flask, render_template, request, redirect, url_for, session, jsonify
+from flask_login import LoginManager, login_user, logout_user, login_required, current_user
+from flask_migrate import Migrate
+from config import config
+from models import db, User, BetAnalysis, AnalysisFeedback, StripeEvent
 import logging
-from flask import Flask, jsonify
-from dotenv import load_dotenv
+from datetime import datetime, timedelta
+import os
 
-# Load environment variables from .env file
-load_dotenv()
-
-# Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
-logger = logging.getLogger(__name__)
-
-
-def create_app(config_name='development'):
-    """
-    Application Factory Pattern
-    Creates and configures the Flask application instance
+def create_app(config_name=None):
+    """Application factory"""
     
-    Args:
-        config_name (str): Configuration environment ('development', 'production', 'testing')
-    
-    Returns:
-        Flask: Configured Flask application instance
-    """
+    if config_name is None:
+        config_name = os.getenv('FLASK_ENV', 'development')
     
     app = Flask(__name__)
+    app.config.from_object(config[config_name])
     
-    # Load configuration based on environment
-    from app.config import config
-    config_obj = config.get(config_name, config['development'])
-    app.config.from_object(config_obj)
-    
-    logger.info(f"Creating Flask app with config: {config_name}")
-    
-    # ========================================================================
-    # INITIALIZE EXTENSIONS
-    # ========================================================================
-    
-    # Database (SQLAlchemy)
-    from app import db
+    # Initialize extensions
     db.init_app(app)
-    logger.info("✓ Database initialized")
+    migrate = Migrate(app, db)
     
-    # Database Migrations (Alembic)
-    from flask_migrate import Migrate
-    Migrate(app, db)
-    logger.info("✓ Database migrations initialized")
+    login_manager = LoginManager()
+    login_manager.init_app(app)
+    login_manager.login_view = 'login'
+    login_manager.login_message = 'Please log in to access this page.'
     
-    # JWT Authentication
-    from flask_jwt_extended import JWTManager
-    jwt = JWTManager(app)
-    logger.info("✓ JWT authentication initialized")
+    @login_manager.user_loader
+    def load_user(user_id):
+        return User.query.get(user_id)
     
-    # CORS (Cross-Origin Resource Sharing)
-    from flask_cors import CORS
-    CORS(app, resources={r"/api/*": {"origins": "*"}})
-    logger.info("✓ CORS enabled")
-    
-    # Rate Limiter
-    from flask_limiter import Limiter
-    from flask_limiter.util import get_remote_address
-    limiter = Limiter(
-        app=app,
-        key_func=get_remote_address,
-        default_limits=["200 per day", "50 per hour"],
-        storage_uri=app.config.get('REDIS_URL', 'redis://localhost:6379/0')
+    # Configure logging
+    logging.basicConfig(
+        level=app.config['LOG_LEVEL'],
+        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
     )
-    logger.info("✓ Rate limiter initialized")
+    logger = logging.getLogger(__name__)
     
-    # ========================================================================
-    # INITIALIZE EXTERNAL SERVICES
-    # ========================================================================
+    with app.app_context():
+        db.create_all()
     
-    # Redis Client (for caching)
-    import redis
-    try:
-        redis_client = redis.from_url(
-            app.config.get('REDIS_URL', 'redis://localhost:6379/0')
+    # ==================== Public Routes ====================
+    
+    @app.route('/')
+    def index():
+        """Landing page"""
+        if current_user.is_authenticated:
+            return redirect(url_for('dashboard'))
+        return render_template('index.html')
+    
+    
+    @app.route('/register', methods=['GET', 'POST'])
+    def register():
+        """User registration"""
+        if current_user.is_authenticated:
+            return redirect(url_for('dashboard'))
+        
+        if request.method == 'POST':
+            data = request.get_json() if request.is_json else request.form
+            username = data.get('username', '').strip()
+            email = data.get('email', '').strip()
+            password = data.get('password', '')
+            confirm_password = data.get('confirm_password', '')
+            
+            # Validation
+            if not username or not email or not password:
+                return jsonify({'error': 'Missing required fields'}), 400
+            
+            if len(password) < 8:
+                return jsonify({'error': 'Password must be at least 8 characters'}), 400
+            
+            if password != confirm_password:
+                return jsonify({'error': 'Passwords do not match'}), 400
+            
+            if User.query.filter_by(username=username).first():
+                return jsonify({'error': 'Username already exists'}), 409
+            
+            if User.query.filter_by(email=email).first():
+                return jsonify({'error': 'Email already registered'}), 409
+            
+            # Create user
+            try:
+                user = User(
+                    username=username,
+                    email=email,
+                    is_active=True,
+                    subscription_status='trial',
+                    trial_ends_at=datetime.utcnow() + timedelta(days=7)
+                )
+                user.set_password(password)
+                
+                db.session.add(user)
+                db.session.commit()
+                
+                login_user(user)
+                logger.info(f'New user registered: {username}')
+                
+                return redirect(url_for('upgrade_subscription'))
+            except Exception as e:
+                db.session.rollback()
+                logger.error(f'Registration error: {str(e)}')
+                return jsonify({'error': 'Registration failed'}), 500
+        
+        return render_template('register.html')
+    
+    
+    @app.route('/login', methods=['GET', 'POST'])
+    def login():
+        """User login"""
+        if current_user.is_authenticated:
+            return redirect(url_for('dashboard'))
+        
+        if request.method == 'POST':
+            data = request.get_json() if request.is_json else request.form
+            username = data.get('username', '')
+            password = data.get('password', '')
+            
+            user = User.query.filter_by(username=username).first()
+            
+            if user and user.check_password(password):
+                login_user(user)
+                logger.info(f'User logged in: {username}')
+                return redirect(url_for('dashboard'))
+            else:
+                return jsonify({'error': 'Invalid username or password'}), 401
+        
+        return render_template('login.html')
+    
+    
+    @app.route('/logout')
+    @login_required
+    def logout():
+        """User logout"""
+        logout_user()
+        return redirect(url_for('index'))
+    
+    
+    # ==================== Dashboard Routes ====================
+    
+    @app.route('/dashboard')
+    @login_required
+    def dashboard():
+        """Main dashboard"""
+        if not current_user.has_analysis_access():
+            return redirect(url_for('upgrade_subscription'))
+        
+        recent_analyses = BetAnalysis.query.filter_by(
+            user_id=current_user.id
+        ).order_by(BetAnalysis.created_at.desc()).limit(5).all()
+        
+        return render_template(
+            'dashboard.html',
+            recent_analyses=recent_analyses,
+            remaining_requests=current_user.get_remaining_requests()
         )
-        # Test connection
-        redis_client.ping()
-        logger.info("✓ Redis client initialized and connected")
-    except Exception as e:
-        logger.warning(f"⚠ Redis connection failed: {str(e)}")
-        redis_client = None
     
-    # Sportsbook API Client (RapidAPI)
-    from app.external_apis.sportsbook import SportsBookAPIClient
-    try:
-        sportsbook_client = SportsBookAPIClient(
-            api_key=app.config.get('RAPIDAPI_KEY'),
-            api_host=app.config.get('RAPIDAPI_HOST'),
-            redis_client=redis_client
+    
+    @app.route('/analyze')
+    @login_required
+    def analyze():
+        """Analysis selection page"""
+        if not current_user.has_analysis_access():
+            return redirect(url_for('upgrade_subscription'))
+        
+        return render_template('analyze.html')
+    
+    
+    @app.route('/api/analyze/all-bets', methods=['POST'])
+    @login_required
+    def analyze_all_bets():
+        """Analyze all possible bets"""
+        if not current_user.has_analysis_access():
+            return jsonify({'error': 'Unauthorized'}), 403
+        
+        if current_user.can_use_preview():
+            current_user.free_preview_used += 1
+        
+        try:
+            analysis = BetAnalysis(
+                user_id=current_user.id,
+                analysis_type='all_bets',
+                status='processing'
+            )
+            db.session.add(analysis)
+            db.session.commit()
+            
+            return jsonify({
+                'analysis_id': analysis.id,
+                'status': 'processing'
+            }), 202
+        except Exception as e:
+            db.session.rollback()
+            logger.error(f'Error creating analysis: {str(e)}')
+            return jsonify({'error': 'Failed to create analysis'}), 500
+    
+    
+    @app.route('/api/analyze/specific-bet', methods=['POST'])
+    @login_required
+    def analyze_specific_bet():
+        """Analyze specific bet with legs"""
+        if not current_user.has_analysis_access():
+            return jsonify({'error': 'Unauthorized'}), 403
+        
+        data = request.get_json()
+        sport = data.get('sport')
+        game = data.get('game')
+        bet_legs = data.get('bet_legs', [])
+        
+        if not sport or not game or not bet_legs:
+            return jsonify({'error': 'Missing required fields'}), 400
+        
+        if current_user.can_use_preview():
+            current_user.free_preview_used += 1
+        
+        try:
+            analysis = BetAnalysis(
+                user_id=current_user.id,
+                analysis_type='specific_bet',
+                sport=sport,
+                game=game,
+                bet_legs=bet_legs,
+                status='processing'
+            )
+            db.session.add(analysis)
+            db.session.commit()
+            
+            return jsonify({
+                'analysis_id': analysis.id,
+                'status': 'processing'
+            }), 202
+        except Exception as e:
+            db.session.rollback()
+            logger.error(f'Error creating analysis: {str(e)}')
+            return jsonify({'error': 'Failed to create analysis'}), 500
+    
+    
+    @app.route('/api/analysis/<analysis_id>')
+    @login_required
+    def get_analysis(analysis_id):
+        """Get analysis results"""
+        analysis = BetAnalysis.query.filter_by(
+            id=analysis_id,
+            user_id=current_user.id
+        ).first_or_404()
+        
+        return jsonify({
+            'id': analysis.id,
+            'status': analysis.status,
+            'analysis_type': analysis.analysis_type,
+            'sport': analysis.sport,
+            'game': analysis.game,
+            'api_response': analysis.api_response,
+            'ollama_analysis': analysis.ollama_analysis,
+            'recommendations': analysis.recommendations,
+            'created_at': analysis.created_at.isoformat(),
+            'completed_at': analysis.completed_at.isoformat() if analysis.completed_at else None
+        })
+    
+    
+    @app.route('/analysis-history')
+    @login_required
+    def analysis_history():
+        """View all past analyses"""
+        page = request.args.get('page', 1, type=int)
+        analyses = BetAnalysis.query.filter_by(
+            user_id=current_user.id
+        ).order_by(BetAnalysis.created_at.desc()).paginate(
+            page=page,
+            per_page=app.config['ITEMS_PER_PAGE']
         )
-        logger.info("✓ Sportsbook API client initialized")
-    except Exception as e:
-        logger.error(f"✗ Failed to initialize Sportsbook API client: {str(e)}")
-        sportsbook_client = None
-    
-    # Odds Aggregator
-    from app.external_apis.aggregator import OddsAggregator
-    try:
-        odds_aggregator = OddsAggregator(
-            sportsbook_client=sportsbook_client,
-            redis_client=redis_client
+        
+        return render_template(
+            'analysis_history.html',
+            analyses=analyses
         )
-        logger.info("✓ Odds aggregator initialized")
-    except Exception as e:
-        logger.error(f"✗ Failed to initialize odds aggregator: {str(e)}")
-        odds_aggregator = None
     
-    # Attach services to app context
-    app.sportsbook_client = sportsbook_client
-    app.odds_aggregator = odds_aggregator
-    app.redis_client = redis_client
     
-    # ========================================================================
-    # REGISTER BLUEPRINTS (API Routes)
-    # ========================================================================
+    @app.route('/api/feedback/<analysis_id>', methods=['POST'])
+    @login_required
+    def submit_feedback(analysis_id):
+        """Submit feedback on analysis accuracy"""
+        analysis = BetAnalysis.query.filter_by(
+            id=analysis_id,
+            user_id=current_user.id
+        ).first_or_404()
+        
+        data = request.get_json()
+        is_accurate = data.get('is_accurate')
+        accuracy_score = data.get('accuracy_score')
+        comments = data.get('comments', '')
+        actual_outcome = data.get('actual_outcome', '')
+        
+        try:
+            feedback = AnalysisFeedback(
+                user_id=current_user.id,
+                analysis_id=analysis_id,
+                is_accurate=is_accurate,
+                accuracy_score=accuracy_score,
+                comments=comments,
+                actual_outcome=actual_outcome
+            )
+            db.session.add(feedback)
+            db.session.commit()
+            
+            logger.info(f'Feedback submitted for analysis {analysis_id}')
+            return jsonify({'success': True}), 201
+        except Exception as e:
+            db.session.rollback()
+            logger.error(f'Error submitting feedback: {str(e)}')
+            return jsonify({'error': 'Failed to submit feedback'}), 500
     
-    try:
-        from app.auth.routes import auth_bp
-        app.register_blueprint(auth_bp)
-        logger.info("✓ Auth blueprint registered")
-    except ImportError as e:
-        logger.warning(f"⚠ Could not import auth blueprint: {str(e)}")
     
-    try:
-        from app.api.odds.routes import odds_bp
-        app.register_blueprint(odds_bp)
-        logger.info("✓ Odds API blueprint registered")
-    except ImportError as e:
-        logger.warning(f"⚠ Could not import odds blueprint: {str(e)}")
+    # ==================== Subscription Routes ====================
     
-    try:
-        from app.api.analysis.routes import analysis_bp
-        app.register_blueprint(analysis_bp)
-        logger.info("✓ Analysis API blueprint registered")
-    except ImportError as e:
-        logger.warning(f"⚠ Could not import analysis blueprint: {str(e)}")
+    @app.route('/upgrade')
+    @login_required
+    def upgrade_subscription():
+        """Upgrade subscription page"""
+        return render_template(
+            'upgrade.html',
+            stripe_key=app.config['STRIPE_PUBLISHABLE_KEY'],
+            subscription_price=app.config['SUBSCRIPTION_PRICE']
+        )
     
-    try:
-        from app.api.history.routes import history_bp
-        app.register_blueprint(history_bp)
-        logger.info("✓ History API blueprint registered")
-    except ImportError as e:
-        logger.warning(f"⚠ Could not import history blueprint: {str(e)}")
     
-    # ========================================================================
-    # SHELL CONTEXT (for Flask shell)
-    # ========================================================================
+    @app.route('/profile')
+    @login_required
+    def profile():
+        """User profile page"""
+        return render_template('profile.html', user=current_user)
     
-    @app.shell_context_processor
-    def make_shell_context():
-        """Make database available in Flask shell"""
-        return {
-            'db': db,
-            'redis_client': redis_client,
-            'sportsbook_client': sportsbook_client
-        }
     
-    # ========================================================================
-    # ERROR HANDLERS
-    # ========================================================================
+    # ==================== Error Handlers ====================
     
     @app.errorhandler(404)
     def not_found(error):
-        """Handle 404 Not Found errors"""
-        return jsonify({
-            'error': 'Not found',
-            'message': 'The requested resource was not found'
-        }), 404
+        return render_template('404.html'), 404
     
     @app.errorhandler(500)
-    def internal_error(error):
-        """Handle 500 Internal Server errors"""
-        db.session.rollback()
-        return jsonify({
-            'error': 'Internal server error',
-            'message': 'An unexpected error occurred'
-        }), 500
-    
-    @app.errorhandler(401)
-    def unauthorized(error):
-        """Handle 401 Unauthorized errors"""
-        return jsonify({
-            'error': 'Unauthorized',
-            'message': 'Authentication required'
-        }), 401
-    
-    @app.errorhandler(403)
-    def forbidden(error):
-        """Handle 403 Forbidden errors"""
-        return jsonify({
-            'error': 'Forbidden',
-            'message': 'You do not have permission to access this resource'
-        }), 403
-    
-    # ========================================================================
-    # HEALTH CHECK ENDPOINT
-    # ========================================================================
-    
-    @app.route('/health', methods=['GET'])
-    def health_check():
-        """Health check endpoint for monitoring"""
-        status = {
-            'status': 'healthy',
-            'environment': app.config.get('ENVIRONMENT', 'development'),
-            'database': 'connected' if db else 'disconnected',
-            'redis': 'connected' if redis_client else 'disconnected',
-            'api_client': 'initialized' if sportsbook_client else 'not initialized'
-        }
-        return jsonify(status), 200
-    
-    # ========================================================================
-    # REQUEST/RESPONSE HOOKS
-    # ========================================================================
-    
-    @app.before_request
-    def before_request():
-        """Execute before each request"""
-        from flask import g, request
-        
-        # Attach redis client to request context
-        g.redis = redis_client
-        
-        # Log request
-        logger.debug(f"{request.method} {request.path}")
-    
-    @app.after_request
-    def after_request(response):
-        """Execute after each request"""
-        from flask import request
-        
-        # Log response status
-        logger.debug(f"Response status: {response.status_code}")
-        
-        return response
-    
-    # ========================================================================
-    # DATABASE CONTEXT
-    # ========================================================================
-    
-    @app.teardown_appcontext
-    def shutdown_session(exception=None):
-        """Clean up database sessions"""
-        pass  # SQLAlchemy handles this automatically
-    
-    # ========================================================================
-    # INITIALIZATION LOG
-    # ========================================================================
-    
-    logger.info("=" * 60)
-    logger.info("WagerWise Application Initialized Successfully")
-    logger.info(f"Environment: {app.config.get('ENVIRONMENT', 'development')}")
-    logger.info(f"Debug Mode: {app.debug}")
-    logger.info(f"Database: {app.config.get('SQLALCHEMY_DATABASE_URI', 'Not configured')}")
-    logger.info("=" * 60)
+    def server_error(error):
+        logger.error(f'Server error: {str(error)}')
+        return render_template('500.html'), 500
     
     return app
 
 
-# ============================================================================
-# APPLICATION ENTRY POINT
-# ============================================================================
-
 if __name__ == '__main__':
-    """
-    Run the Flask application
-    This is only used for local development
-    For production, use: gunicorn -w 4 -b 0.0.0.0:8000 app:create_app()
-    """
-    
-    # Determine config from environment
-    config_name = os.getenv('FLASK_ENV', 'development')
-    
-    # Create app
-    app = create_app(config_name)
-    
-    # Run development server
-    app.run(
-        host='0.0.0.0',
-        port=5000,
-        debug=(config_name == 'development')
-    )
+    app = create_app()
+    app.run(debug=True, host='0.0.0.0', port=5000)
